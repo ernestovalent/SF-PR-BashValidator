@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # -----------------------------------------------------------------------------
-# Script: pr-validate
+# Script: validate.sh
 # Propósito: Validar Pull Request (Linting, Análisis Estático, Validación de Despliegue)
 # -----------------------------------------------------------------------------
 
@@ -14,27 +14,33 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 ICON_OK="✅"
 ICON_ERR="❌"
-ICON_WARN="⚠️"
+ICON_WARN="⚠️ "
 ICON_INFO="ℹ️ "
 ICON_RUN="🚀"
 
 # --- Cargar Variables de Entorno ---
-if [ -f .env ]; then
-    source .env
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
 else
-    echo -e "${YELLOW}${ICON_WARN} Archivo .env no encontrado. Usando valores internos por defecto.${NC}"
-    # Configuración por defecto para pr-validate
-    ALIAS_DEFAULT="sandbox"
+    echo -e "${YELLOW}${ICON_WARN} Archivo .env no encontrado. Usa parámetros de entrada. Más información en --help.${NC}"
+    
+    # Configuración de parámetros por defecto para validate.sh
+    ALIAS_DEFAULT=""
     TARGET_DEFAULT="develop"
+
     # Rutas de archivos temporales
-    PATH_PMD_LIST="pmd-clases.txt"
-    PATH_JS_LIST="js-scripts.txt"
     PATH_DIFF="diff.txt"
+    PATH_PMD_LIST="pmd.txt"
+    PATH_JS_LIST="js.txt"
     PATH_RESULTS="results.txt"
-    # Configuración por defecto de PMD
-    PATH_PMD_RULES="apex-rules.xml"
+
+    # Configuración de PMD por defecto
+    PATH_PMD_RULES="pmd-rules.xml"
+    TEST_CLASS_FILE="unitTest.txt"
+    
     # Rutas o Comandos base
-    CMD_PMD="pmd"
     CMD_ESLINT="npx eslint"
 fi
 
@@ -75,7 +81,7 @@ function log_verbose() {
 }
 
 function show_help() {
-    echo -e "${GREEN}Uso: pr-validate [opciones]${NC}"
+    echo -e "${GREEN}Uso: validate.sh [opciones]${NC}"
     echo ""
     echo "Opciones:"
     echo "  --target=<rama>   Rama destino (Ej: fullcopy_branch). Por defecto: $TARGET_DEFAULT"
@@ -116,10 +122,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-if [ -z "$SF_ALIAS" ]; then
-    log_error "El Alias de la Org es obligatorio. Define ALIAS_DEFAULT en .env o usa --alias"
-    exit 1
-fi
+
 
 # Limpiar archivo de resultados previo
 echo "Resumen de Validación de Código" > "$PATH_RESULTS"
@@ -154,7 +157,7 @@ check_cmd() {
 check_cmd git
 check_cmd npm
 check_cmd sf
-check_cmd $CMD_PMD
+check_cmd pmd
 
 # Instalar sfdx-git-delta si no existe (Check plugin list)
 if ! sf plugins inspect sfdx-git-delta &> /dev/null; then
@@ -188,7 +191,8 @@ fi
 
 # Obtener diferencias (Archivos modificados entre el HEAD actual y el destino remoto)
 # Usamos git diff con ... para encontrar el ancestro común
-git diff --name-only "origin/$TARGET_BRANCH...HEAD" > "$PATH_DIFF"
+# Se usa --name-status para detectar eliminados (D) y renombrados (R)
+git diff --name-status "origin/$TARGET_BRANCH...HEAD" > "$PATH_DIFF"
 
 NUM_DIFF=$(wc -l < "$PATH_DIFF")
 
@@ -205,7 +209,12 @@ log_verbose "Archivos guardados en $PATH_DIFF"
 log_step "Análisis estático de Apex (PMD)..."
 
 # Filtrar Clases
-grep -E ".*\.cls$" "$PATH_DIFF" > "$PATH_PMD_LIST" || true
+# Lógica:
+# 1. Ignorar si el status (columna 1) empieza con 'D' (Deleted)
+# 2. Si empieza con 'R' (Renamed), tomar la columna 3 (nuevo path)
+# 3. En otros casos (M, A), tomar la columna 2
+# 4. Filtrar que termine en .cls
+awk '$1 !~ /^D/ { if ($1 ~ /^R/) print $3; else print $2 }' "$PATH_DIFF" | grep -E ".*\.cls$" > "$PATH_PMD_LIST" || true
 COUNT_CLS=$(wc -l < "$PATH_PMD_LIST")
 
 if [ "$COUNT_CLS" -gt 0 ]; then
@@ -213,7 +222,7 @@ if [ "$COUNT_CLS" -gt 0 ]; then
     
     echo -e "\n\n### REPORTES PMD (APEX) ###\n" >> "$PATH_RESULTS"
 
-    PMD_CMD="$CMD_PMD check -d . -R \"$PATH_PMD_RULES\" --file-list \"$PATH_PMD_LIST\" --no-cache --no-progress"
+    PMD_CMD="pmd check -R=$PATH_PMD_RULES --file-list=$PATH_PMD_LIST --no-cache --no-progress --show-suppressed"
     
     if [ "$VERBOSE" = true ]; then
         # Ejecutar y mostrar en pantalla, además de guardar en results
@@ -233,7 +242,8 @@ fi
 log_step "Linting de Javascript (ESLint)..."
 
 # Filtrar JS (Ignorar standard objects u otros si es necesario, aquí agarramos todo .js)
-grep -E ".*\.js$" "$PATH_DIFF" > "$PATH_JS_LIST" || true
+# Misma lógica que para Apex
+awk '$1 !~ /^D/ { if ($1 ~ /^R/) print $3; else print $2 }' "$PATH_DIFF" | grep -E ".*\.js$" > "$PATH_JS_LIST" || true
 COUNT_JS=$(wc -l < "$PATH_JS_LIST")
 
 if [ "$COUNT_JS" -gt 0 ]; then
@@ -263,14 +273,13 @@ fi
 log_step "Generando Delta y Validando Despliegue en Salesforce..."
 
 # Generar carpeta de salida para delta
-DELTA_OUTPUT="deploy_delta"
-mkdir -p "$DELTA_OUTPUT"
+
 
 # Usar plugin sgd
 # "origin/$TARGET_BRANCH" es el "from" (estado estable) y "HEAD" es el "to" (estado propuesto)
 log_info "Generando package.xml incremental..."
 
-SGD_CMD="sf sgd source delta --to HEAD --from origin/$TARGET_BRANCH --output $DELTA_OUTPUT --generate-delta"
+SGD_CMD="sf sgd source delta --to HEAD --from $(git merge-base HEAD origin/$TARGET_BRANCH) --output-dir=."
 
 if [ "$VERBOSE" = true ]; then
     $SGD_CMD
@@ -278,17 +287,33 @@ else
     $SGD_CMD &> /dev/null
 fi
 
-MANIFEST_PATH="$DELTA_OUTPUT/package/package.xml"
-
-if [ -f "$MANIFEST_PATH" ]; then
-    # Chequear si package.xml tiene contenido real (a veces SGD genera xml vacio si solo hay cambios en archivos ignorados)
-    # Una forma simple es intentar deploy validate, si está vacio SF avisará.
-    
+if [ -n "$SF_ALIAS" ]; then
     log_info "Iniciando Validación contra la Org: $SF_ALIAS"
-    log_verbose "Usando manifiesto: $MANIFEST_PATH"
+    log_verbose "Usando manifiesto: package/package.xml"
 
     # Validate only
-    SF_DEPLOY_CMD="sf project deploy validate --manifest \"$MANIFEST_PATH\" --target-org \"$SF_ALIAS\" --wait 30"
+    # Leer archivo de tests si está configurado
+    TESTS=""
+    if [ -n "$TEST_CLASS_FILE" ]; then
+        if [ -f "$TEST_CLASS_FILE" ]; then
+            log_info "Leyendo clases de test desde $TEST_CLASS_FILE..."
+            # Extraer nombres de clases entre Apex::[ y ]::Apex
+            TESTS=$(grep -o "Apex::\[[^]]*\]::Apex" "$TEST_CLASS_FILE" | sed 's/Apex::\[//; s/\]::Apex//' | tr '\n' ' ' | xargs)
+            
+            if [ -n "$TESTS" ]; then
+                log_success "Tests identificados: $TESTS"
+            else
+                echo -e "${YELLOW}${ICON_WARN} No se encontraron tests con el formato Apex::[Nombre]::Apex en $TEST_CLASS_FILE${NC}"
+            fi
+        else
+            echo -e "${YELLOW}${ICON_WARN} El archivo de tests configurado ($TEST_CLASS_FILE) no fue encontrado.${NC}"
+        fi
+    fi
+
+    # Validate only
+    # Si TESTS está vacío, esto podría fallar si se usa RunSpecifiedTests. 
+    # Se asume que el usuario proveerá tests o manejará el error.
+    SF_DEPLOY_CMD="sf project deploy validate --target-org=$SF_ALIAS --manifest=package/package.xml --test-level=RunSpecifiedTests --tests=$TESTS"
 
     if [ "$VERBOSE" = true ]; then
          $SF_DEPLOY_CMD
@@ -297,15 +322,14 @@ if [ -f "$MANIFEST_PATH" ]; then
          # Si no es verbose, dejamos que sf muestre su output standard de progreso
          $SF_DEPLOY_CMD
     fi
-    
+
     if [ $? -eq 0 ]; then
         log_success "Validación de despliegue EXITOSA."
     else
-        log_error "La validación de despliegue falló."
+        log_error "La validación de despliegue falló. \n el comando ejecutado fué: ${SF_DEPLOY_CMD}"
     fi
-
 else
-    log_info "No se generó un package.xml válido o no hubo diferencias desplegables detectadas por SGD."
+    log_info "No se proporcionó alias de Salesforce. Omitiendo validación de despliegue."
 fi
 
 
@@ -314,7 +338,7 @@ echo ""
 if [ "$DISCARD" = true ]; then
     log_info "Limpiando archivos temporales (--discard)..."
     rm -f "$PATH_DIFF" "$PATH_PMD_LIST" "$PATH_JS_LIST"
-    rm -rf "$DELTA_OUTPUT"
+    rm -rf package destructiveChanges
 fi
 
 echo -e "${BLUE}=============================================================${NC}"

@@ -5,6 +5,8 @@
 # Propósito: Validar Pull Request (Linting, Análisis Estático, Validación de Despliegue)
 # -----------------------------------------------------------------------------
 
+set -o pipefail
+
 # --- Colores e Iconos ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -18,80 +20,85 @@ ICON_WARN="⚠️ "
 ICON_INFO="ℹ️ "
 ICON_RUN="🚀"
 
+# --- Código de salida global para rastrear fallos no fatales ---
+EXIT_CODE=0
+
 # --- Cargar Variables de Entorno ---
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
 if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
-else
-    echo -e "${YELLOW}${ICON_WARN} Archivo .env no encontrado. Usa parámetros de entrada. Más información en --help.${NC}"
-    
-    # Configuración de parámetros por defecto para validate.sh
-    ALIAS_DEFAULT=""
-    TARGET_DEFAULT="develop"
-
-    # Rutas de archivos temporales
-    PATH_DIFF="diff.txt"
-    PATH_PMD_LIST="pmd.txt"
-    PATH_JS_LIST="js.txt"
-    PATH_RESULTS="results.txt"
-
-    # Configuración de PMD por defecto
-    PATH_PMD_RULES="pmd-rules.xml"
-    TEST_CLASS_FILE="unitTest.txt"
-    
-    # Rutas o Comandos base
-    CMD_ESLINT="npx eslint"
 fi
+
+# Asignar defaults seguros si las variables no fueron definidas (ni por .env ni por entorno)
+ALIAS_DEFAULT="${ALIAS_DEFAULT:-""}"
+TARGET_DEFAULT="${TARGET_DEFAULT:-"develop"}"
+
+PATH_DIFF="${PATH_DIFF:-"diff.txt"}"
+PATH_PMD_LIST="${PATH_PMD_LIST:-"pmd.txt"}"
+PATH_JS_LIST="${PATH_JS_LIST:-"js.txt"}"
+PATH_RESULTS="${PATH_RESULTS:-"results.txt"}"
+
+PATH_PMD_RULES="${PATH_PMD_RULES:-"pmd-rules.xml"}"
+TEST_CLASS_FILE="${TEST_CLASS_FILE:-"unitTest.txt"}"
+
+CMD_ESLINT="${CMD_ESLINT:-"npx eslint"}"
 
 # --- Variables Globales ---
 VERBOSE=false
 DISCARD=false
+DRY_RUN=false
 TARGET_BRANCH="$TARGET_DEFAULT"
 SF_ALIAS="$ALIAS_DEFAULT"
-PROJECT_ROOT=$(pwd)
+PROJECT_ROOT="$(pwd)"
 CURRENT_STEP=0
-TOTAL_STEPS=5
+TOTAL_STEPS=7
 
 # --- Funciones de Utilidad ---
 
-function log_step() {
+log_step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
     echo -e "\n${BLUE}=============================================================${NC}"
     echo -e "${BLUE}${ICON_RUN} Paso $CURRENT_STEP: $1${NC}"
     echo -e "${BLUE}=============================================================${NC}"
 }
 
-function log_info() {
+log_info() {
     echo -e "${CYAN}${ICON_INFO} $1${NC}"
 }
 
-function log_success() {
+log_success() {
     echo -e "${GREEN}${ICON_OK} $1${NC}"
 }
 
-function log_error() {
+log_warn() {
+    echo -e "${YELLOW}${ICON_WARN} $1${NC}"
+}
+
+log_error() {
     echo -e "${RED}${ICON_ERR} $1${NC}"
 }
 
-function log_verbose() {
+log_verbose() {
     if [ "$VERBOSE" = true ]; then
         echo -e "${YELLOW}[VERBOSE] $1${NC}"
     fi
 }
 
-function show_help() {
+show_help() {
     echo -e "${GREEN}Uso: validate.sh [opciones]${NC}"
     echo ""
     echo "Opciones:"
     echo "  --target=<rama>   Rama destino (Ej: fullcopy_branch). Por defecto: $TARGET_DEFAULT"
     echo "  --alias=<alias>   Alias de Salesforce Org (Ej: fullcopy). Por defecto: $ALIAS_DEFAULT"
     echo "  --discard         Elimina los archivos temporales generados al finalizar (pmd-list, diff, etc)."
+    echo "  --dry-run         Ejecuta análisis estático pero omite el despliegue a Salesforce."
     echo "  --verbose         Muestra salida detallada de los comandos."
     echo "  -h, --help        Muestra esta ayuda."
     echo ""
     echo "Ejemplo:"
-    echo "  ./pr-validate.sh --target=uat --alias=uat_sandbox --discard --verbose"
+    echo "  ./validate.sh --target=uat --alias=uat_sandbox --discard --verbose"
+    echo "  ./validate.sh --target=uat --dry-run    # Solo linting, sin deploy"
     exit 0
 }
 
@@ -107,6 +114,9 @@ while [ $# -gt 0 ]; do
             ;;
         --discard)
             DISCARD=true
+            ;;
+        --dry-run)
+            DRY_RUN=true
             ;;
         --verbose)
             VERBOSE=true
@@ -124,6 +134,19 @@ done
 
 
 
+# --- Trap para limpieza en caso de error o interrupción ---
+cleanup() {
+    local exit_status=$?
+    if [ "$DISCARD" = true ]; then
+        rm -f "$PATH_DIFF" "$PATH_PMD_LIST" "$PATH_JS_LIST"
+        rm -rf package destructiveChanges
+    fi
+    if [ "$exit_status" -ne 0 ] && [ "$exit_status" -ne "$EXIT_CODE" ]; then
+        log_error "Script interrumpido con código de salida: $exit_status"
+    fi
+}
+trap cleanup EXIT
+
 # Limpiar archivo de resultados previo
 echo "Resumen de Validación de Código" > "$PATH_RESULTS"
 echo "Generado el: $(date)" >> "$PATH_RESULTS"
@@ -140,24 +163,27 @@ if [ ! -d ".git" ]; then
     exit 1
 fi
 
-# Function to check command existence
+# Verificar existencia de un comando. Segundo argumento indica si es obligatorio.
 check_cmd() {
-    if ! command -v "$1" &> /dev/null; then
-        if [ "$1" == "npm" ] || [ "$1" == "git" ]; then
-             log_error "$1 no está instalado. Por favor instálalo."
-             exit 1
-        else 
-            log_info "Herramienta $1 no encontrada en PATH, se intentará ejecución local o reportar error."
+    local cmd="$1"
+    local required="${2:-false}"
+    if ! command -v "$cmd" &> /dev/null; then
+        if [ "$required" = true ]; then
+            log_error "$cmd no está instalado. Por favor instálalo."
+            exit 1
+        else
+            log_warn "Herramienta $cmd no encontrada en PATH. Pasos que la requieran podrían fallar."
         fi
     else
-        log_verbose "$1 detectado."
+        log_verbose "$cmd detectado."
     fi
 }
 
-check_cmd git
-check_cmd npm
-check_cmd sf
-check_cmd pmd
+check_cmd git true
+check_cmd npm true
+check_cmd sf true
+check_cmd jq false
+check_cmd pmd false
 
 # Instalar sfdx-git-delta si no existe (Check plugin list)
 if ! sf plugins inspect sfdx-git-delta &> /dev/null; then
@@ -175,12 +201,12 @@ CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 log_info "Rama Actual: $CURRENT_BRANCH"
 log_info "Rama Destino: origin/$TARGET_BRANCH"
 
-# Fetch para tener últimas referencias
-log_info "Actualizando referencias (git fetch)..."
+# Fetch para tener últimas referencias (solo origin, no todos los remotos)
+log_info "Actualizando referencias (git fetch origin)..."
 if [ "$VERBOSE" = true ]; then
-    git fetch --all
+    git fetch origin
 else
-    git fetch --all &> /dev/null
+    git fetch origin &> /dev/null
 fi
 
 # Validar si la rama remota existe
@@ -222,16 +248,29 @@ if [ "$COUNT_CLS" -gt 0 ]; then
     
     echo -e "\n\n### REPORTES PMD (APEX) ###\n" >> "$PATH_RESULTS"
 
-    PMD_CMD="pmd check -R=$PATH_PMD_RULES --file-list=$PATH_PMD_LIST --no-cache --no-progress --show-suppressed"
-    
-    if [ "$VERBOSE" = true ]; then
-        # Ejecutar y mostrar en pantalla, además de guardar en results
-        # Nota: PMD retorna exit code != 0 si hay violaciones, permitimos que continúe
-        eval "$PMD_CMD" | tee -a "$PATH_RESULTS" || true
+    # Verificar que el archivo de reglas PMD exista
+    if [ ! -f "$PATH_PMD_RULES" ]; then
+        log_error "Archivo de reglas PMD no encontrado: $PATH_PMD_RULES"
+        echo "ERROR: Archivo de reglas PMD no encontrado: $PATH_PMD_RULES" >> "$PATH_RESULTS"
+        EXIT_CODE=1
     else
-        eval "$PMD_CMD" >> "$PATH_RESULTS" 2>&1 || true
+        # Ejecutar PMD sin eval — usando argumentos directos
+        PMD_EXIT=0
+        if [ "$VERBOSE" = true ]; then
+            pmd check "-R=$PATH_PMD_RULES" "--file-list=$PATH_PMD_LIST" --no-cache --no-progress --show-suppressed \
+                | tee -a "$PATH_RESULTS" || PMD_EXIT=$?
+        else
+            pmd check "-R=$PATH_PMD_RULES" "--file-list=$PATH_PMD_LIST" --no-cache --no-progress --show-suppressed \
+                >> "$PATH_RESULTS" 2>&1 || PMD_EXIT=$?
+        fi
+
+        if [ "$PMD_EXIT" -ne 0 ]; then
+            log_warn "PMD reportó violaciones (exit code: $PMD_EXIT). Revisa $PATH_RESULTS para detalles."
+            EXIT_CODE=1
+        else
+            log_success "Análisis PMD completado sin violaciones."
+        fi
     fi
-    log_success "Análisis PMD completado."
 else
     log_info "No se encontraron archivos .cls modificados."
     echo -e "\n\n### REPORTES PMD ###\nSin cambios en Apex." >> "$PATH_RESULTS"
@@ -250,100 +289,155 @@ if [ "$COUNT_JS" -gt 0 ]; then
     log_info "Analizando $COUNT_JS archivos JS..."
     echo -e "\n\n### REPORTES ESLINT (JS) ###\n" >> "$PATH_RESULTS"
     
-    # Leer lista y ejecutar eslint por archivo o por lista
-    # ESLint generalmente acepta archivos como argumentos.
-    # Usamos tr para convertir nuevas lineas en espacios para pasarlo como args
-    JS_FILES=$(tr '\n' ' ' < "$PATH_JS_LIST")
-    
-    ESLINT_RUN="$CMD_ESLINT $JS_FILES"
-
+    # Usar xargs para manejar correctamente archivos con espacios u otros caracteres especiales
+    ESLINT_EXIT=0
     if [ "$VERBOSE" = true ]; then
-        $ESLINT_RUN | tee -a "$PATH_RESULTS" || true
+        xargs $CMD_ESLINT < "$PATH_JS_LIST" | tee -a "$PATH_RESULTS" || ESLINT_EXIT=$?
     else
-        $ESLINT_RUN >> "$PATH_RESULTS" 2>&1 || true
+        xargs $CMD_ESLINT < "$PATH_JS_LIST" >> "$PATH_RESULTS" 2>&1 || ESLINT_EXIT=$?
     fi
-    log_success "Análisis ESLint completado."
+
+    if [ "$ESLINT_EXIT" -ne 0 ]; then
+        log_warn "ESLint reportó problemas (exit code: $ESLINT_EXIT). Revisa $PATH_RESULTS para detalles."
+        EXIT_CODE=1
+    else
+        log_success "Análisis ESLint completado sin errores."
+    fi
 else
     log_info "No se encontraron archivos .js modificados."
     echo -e "\n\n### REPORTES ESLINT ###\nSin cambios en JS." >> "$PATH_RESULTS"
 fi
 
 
-# 5. Validación de Despliegue (Git Delta + SF)
+# 5. Formatear archivos con Prettier
+log_step "Formateando archivos con Prettier..."
+
+PRETTIER_FILES=()
+if [ -f "$PATH_JS_LIST" ] && [ "$(wc -l < "$PATH_JS_LIST")" -gt 0 ]; then
+    while IFS= read -r line; do
+        PRETTIER_FILES+=("$line")
+    done < "$PATH_JS_LIST"
+fi
+if [ -f "$PATH_PMD_LIST" ] && [ "$(wc -l < "$PATH_PMD_LIST")" -gt 0 ]; then
+    while IFS= read -r line; do
+        PRETTIER_FILES+=("$line")
+    done < "$PATH_PMD_LIST"
+fi
+
+if [ "${#PRETTIER_FILES[@]}" -gt 0 ]; then
+    log_info "Formateando ${#PRETTIER_FILES[@]} archivos con Prettier..."
+    PRETTIER_EXIT=0
+    if [ "$VERBOSE" = true ]; then
+        npx prettier --write "${PRETTIER_FILES[@]}" || PRETTIER_EXIT=$?
+    else
+        npx prettier --write "${PRETTIER_FILES[@]}" >> "$PATH_RESULTS" 2>&1 || PRETTIER_EXIT=$?
+    fi
+
+    if [ "$PRETTIER_EXIT" -ne 0 ]; then
+        log_warn "Prettier reportó problemas (exit code: $PRETTIER_EXIT). Revisa $PATH_RESULTS para detalles."
+        EXIT_CODE=1
+    else
+        log_success "Formateo con Prettier completado exitosamente."
+    fi
+else
+    log_info "No se encontraron archivos .js o .cls para formatear con Prettier."
+fi
+
+
+# 6. Validación de Despliegue (Git Delta + SF)
 log_step "Generando Delta y Validando Despliegue en Salesforce..."
 
-# Generar carpeta de salida para delta
-
-
-# Usar plugin sgd
-# "origin/$TARGET_BRANCH" es el "from" (estado estable) y "HEAD" es el "to" (estado propuesto)
-log_info "Generando package.xml incremental..."
-
-SGD_CMD="sf sgd source delta --to HEAD --from $(git merge-base HEAD origin/$TARGET_BRANCH) --output-dir=."
-
-if [ "$VERBOSE" = true ]; then
-    $SGD_CMD
+if [ "$DRY_RUN" = true ]; then
+    log_info "Modo --dry-run activo. Omitiendo generación de delta y despliegue a Salesforce."
 else
-    $SGD_CMD &> /dev/null
-fi
+    # Calcular merge-base de forma segura
+    MERGE_BASE=""
+    MERGE_BASE=$(git merge-base HEAD "origin/$TARGET_BRANCH" 2>/dev/null) || true
 
-if [ -n "$SF_ALIAS" ]; then
-    log_info "Iniciando Validación contra la Org: $SF_ALIAS"
-    log_verbose "Usando manifiesto: package/package.xml"
+    if [ -z "$MERGE_BASE" ]; then
+        log_error "No se pudo calcular el ancestro común (merge-base) entre HEAD y origin/$TARGET_BRANCH."
+        log_error "Verifica que ambas ramas compartan historial."
+        EXIT_CODE=1
+    else
+        log_verbose "Merge-base calculado: $MERGE_BASE"
 
-    # Validate only
-    # Leer archivo de tests si está configurado
-    TESTS=""
-    if [ -n "$TEST_CLASS_FILE" ]; then
-        if [ -f "$TEST_CLASS_FILE" ]; then
-            log_info "Leyendo clases de test desde $TEST_CLASS_FILE..."
-            # Extraer nombres de clases entre Apex::[ y ]::Apex
-            TESTS=$(grep -o "Apex::\[[^]]*\]::Apex" "$TEST_CLASS_FILE" | sed 's/Apex::\[//; s/\]::Apex//' | tr '\n' ' ' | xargs)
-            
-            if [ -n "$TESTS" ]; then
-                log_success "Tests identificados: $TESTS"
-            else
-                echo -e "${YELLOW}${ICON_WARN} No se encontraron tests con el formato Apex::[Nombre]::Apex en $TEST_CLASS_FILE${NC}"
-            fi
+        # Usar plugin sgd para generar package.xml incremental
+        log_info "Generando package.xml incremental..."
+
+        if [ "$VERBOSE" = true ]; then
+            sf sgd source delta --to HEAD --from "$MERGE_BASE" --output-dir=.
         else
-            echo -e "${YELLOW}${ICON_WARN} El archivo de tests configurado ($TEST_CLASS_FILE) no fue encontrado.${NC}"
+            sf sgd source delta --to HEAD --from "$MERGE_BASE" --output-dir=. &> /dev/null
+        fi
+
+        # Verificar que el manifiesto se haya generado correctamente
+        if [ ! -f "package/package.xml" ]; then
+            log_error "No se generó package/package.xml. El plugin sgd pudo haber fallado."
+            EXIT_CODE=1
+        fi
+
+        if [ -f "package/package.xml" ] && [ -n "$SF_ALIAS" ]; then
+            log_info "Iniciando Validación contra la Org: $SF_ALIAS"
+            log_verbose "Usando manifiesto: package/package.xml"
+
+            # Leer archivo de tests si está configurado
+            TESTS=""
+            if [ -n "$TEST_CLASS_FILE" ]; then
+                if [ -f "$TEST_CLASS_FILE" ]; then
+                    log_info "Leyendo clases de test desde $TEST_CLASS_FILE..."
+                    # Extraer nombres de clases entre Apex::[ y ]::Apex
+                    TESTS=$(grep -o "Apex::\[[^]]*\]::Apex" "$TEST_CLASS_FILE" | sed 's/Apex::\[//; s/\]::Apex//' | tr '\n' ' ' | xargs)
+                    
+                    if [ -n "$TESTS" ]; then
+                        log_success "Tests identificados: $TESTS"
+                    else
+                        log_warn "No se encontraron tests con el formato Apex::[Nombre]::Apex en $TEST_CLASS_FILE"
+                    fi
+                else
+                    log_warn "El archivo de tests configurado ($TEST_CLASS_FILE) no fue encontrado."
+                fi
+            fi
+
+            # Construir comando de deploy según si hay tests o no
+            if [ -z "$TESTS" ]; then
+                log_warn "No se especificaron tests. Usando --test-level=NoTestRun en lugar de RunSpecifiedTests."
+                SF_DEPLOY_CMD=(sf project deploy validate "--target-org=$SF_ALIAS" "--manifest=package/package.xml" "--test-level=NoTestRun")
+            else
+                SF_DEPLOY_CMD=(sf project deploy validate "--target-org=$SF_ALIAS" "--manifest=package/package.xml" "--test-level=RunSpecifiedTests" "--tests=$TESTS")
+            fi
+
+            log_verbose "Comando: ${SF_DEPLOY_CMD[*]}"
+
+            DEPLOY_EXIT=0
+            "${SF_DEPLOY_CMD[@]}" || DEPLOY_EXIT=$?
+
+            if [ "$DEPLOY_EXIT" -eq 0 ]; then
+                log_success "Validación de despliegue EXITOSA."
+            else
+                log_error "La validación de despliegue falló (exit code: $DEPLOY_EXIT)."
+                log_error "Comando ejecutado: ${SF_DEPLOY_CMD[*]}"
+                EXIT_CODE=1
+            fi
+        elif [ -f "package/package.xml" ]; then
+            log_info "No se proporcionó alias de Salesforce (--alias). Omitiendo validación de despliegue."
         fi
     fi
-
-    # Validate only
-    # Si TESTS está vacío, esto podría fallar si se usa RunSpecifiedTests. 
-    # Se asume que el usuario proveerá tests o manejará el error.
-    SF_DEPLOY_CMD="sf project deploy validate --target-org=$SF_ALIAS --manifest=package/package.xml --test-level=RunSpecifiedTests --tests=$TESTS"
-
-    if [ "$VERBOSE" = true ]; then
-         $SF_DEPLOY_CMD
-    else
-         # Mostramos salida en vivo pero filtrada o solo resultado final. 
-         # Si no es verbose, dejamos que sf muestre su output standard de progreso
-         $SF_DEPLOY_CMD
-    fi
-
-    if [ $? -eq 0 ]; then
-        log_success "Validación de despliegue EXITOSA."
-    else
-        log_error "La validación de despliegue falló. \n el comando ejecutado fué: ${SF_DEPLOY_CMD}"
-    fi
-else
-    log_info "No se proporcionó alias de Salesforce. Omitiendo validación de despliegue."
 fi
 
 
-# --- Finalización y Limpieza ---
+# --- Finalización ---
 echo ""
-if [ "$DISCARD" = true ]; then
-    log_info "Limpiando archivos temporales (--discard)..."
-    rm -f "$PATH_DIFF" "$PATH_PMD_LIST" "$PATH_JS_LIST"
-    rm -rf package destructiveChanges
+echo -e "${BLUE}=============================================================${NC}"
+if [ "$EXIT_CODE" -eq 0 ]; then
+    echo -e "${GREEN}${ICON_OK} Proceso completado exitosamente.${NC}"
+else
+    echo -e "${YELLOW}${ICON_WARN} Proceso completado con advertencias o errores (código: $EXIT_CODE).${NC}"
 fi
-
-echo -e "${BLUE}=============================================================${NC}"
-echo -e "${GREEN}${ICON_OK} Proceso completado.${NC}"
 echo -e "Resultados de análisis estático guardados en: ${YELLOW}$PATH_RESULTS${NC}"
+if [ "$DISCARD" = true ]; then
+    log_info "Los archivos temporales serán limpiados automáticamente al salir (--discard)."
+fi
 echo -e "${BLUE}=============================================================${NC}"
 
-exit 0
+# La limpieza se ejecuta automáticamente vía trap EXIT
+exit "$EXIT_CODE"

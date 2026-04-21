@@ -403,7 +403,8 @@ else
                 log_warn "No se especificaron tests. Usando --test-level=NoTestRun en lugar de RunSpecifiedTests."
                 SF_DEPLOY_CMD=(sf project deploy validate "--target-org=$SF_ALIAS" "--manifest=package/package.xml" "--test-level=NoTestRun")
             else
-                SF_DEPLOY_CMD=(sf project deploy validate "--target-org=$SF_ALIAS" "--manifest=package/package.xml" "--test-level=RunSpecifiedTests" "--tests=$TESTS")
+                read -ra TESTS_ARRAY <<< "$TESTS"
+                SF_DEPLOY_CMD=(sf project deploy validate "--target-org=$SF_ALIAS" "--manifest=package/package.xml" "--test-level=RunSpecifiedTests" "--tests" "${TESTS_ARRAY[@]}")
             fi
 
             log_verbose "Comando: ${SF_DEPLOY_CMD[*]}"
